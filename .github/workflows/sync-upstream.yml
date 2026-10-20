@@ -1,0 +1,485 @@
+name: Sync TDLib Artifacts
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/sync-upstream.yml
+      - scripts/**
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: TDLib ref to build
+        required: false
+        default: master
+      force:
+        description: Publish a new immutable rebuild even if this source release exists
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-tdlib-artifacts
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TD_REPO: https://github.com/tdlib/td.git
+  ARTIFACT_SCHEMA_VERSION: '2'
+
+jobs:
+  prepare:
+    name: Resolve upstream TDLib
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+      upstream_short_sha: ${{ steps.resolve.outputs.upstream_short_sha }}
+      tdlib_version: ${{ steps.metadata.outputs.tdlib_version }}
+      build_definition_sha: ${{ steps.metadata.outputs.build_definition_sha }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      should_build: ${{ steps.metadata.outputs.should_build }}
+    steps:
+      - name: Check out TDLib packaging repo
+        uses: actions/checkout@v7
+
+      - name: Resolve upstream commit
+        id: resolve
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
+        run: |
+          upstream_sha="$(git ls-remote "$TD_REPO" "$UPSTREAM_REF" | awk 'NR == 1 { print $1 }')"
+          if [ -z "$upstream_sha" ] && [[ "$UPSTREAM_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            upstream_sha="$UPSTREAM_REF"
+          fi
+          test -n "$upstream_sha"
+          upstream_short_sha="${upstream_sha:0:12}"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_short_sha=$upstream_short_sha" >> "$GITHUB_OUTPUT"
+          echo "TDLib $UPSTREAM_REF -> $upstream_sha"
+
+      - name: Check out TDLib metadata
+        uses: actions/checkout@v7
+        with:
+          repository: tdlib/td
+          ref: ${{ steps.resolve.outputs.upstream_sha }}
+          path: upstream-td
+          sparse-checkout: CMakeLists.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve versioned immutable release
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ inputs.force || false }}
+          UPSTREAM_SHA: ${{ steps.resolve.outputs.upstream_sha }}
+          UPSTREAM_SHORT_SHA: ${{ steps.resolve.outputs.upstream_short_sha }}
+        run: |
+          tdlib_version="$(sed -nE 's/^project\(TDLib VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' upstream-td/CMakeLists.txt)"
+          test -n "$tdlib_version"
+          build_definition_sha="$({
+            sha256sum .github/workflows/sync-upstream.yml
+            sha256sum scripts/build-android-libs.sh
+            sha256sum scripts/build-ios-xcframework.sh
+            sha256sum scripts/build-desktop-lib.sh
+            sha256sum scripts/package-desktop-lib.sh
+          } | sha256sum | awk '{print $1}')"
+          build_definition_short_sha="${build_definition_sha:0:12}"
+          base_release_tag="tdlib-$tdlib_version-$UPSTREAM_SHORT_SHA-build-$build_definition_short_sha-v$ARTIFACT_SCHEMA_VERSION"
+          release_tag="$base_release_tag"
+          should_build=true
+          if gh release view "$base_release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_assets="$(gh release view "$base_release_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            release_complete=true
+            for asset in \
+              tdjson-android-arm64-v8a.zip \
+              tdjson-android-armeabi-v7a.zip \
+              tdjson-android-x86_64.zip \
+              tdjson-ios.xcframework.zip \
+              tdjson-linux-arm64.zip \
+              tdjson-linux-x64.zip \
+              tdjson-macos-universal.zip \
+              tdjson-windows-arm64.zip \
+              tdjson-windows-x64.zip \
+              tdjson-manifest.json \
+              SHA256SUMS; do
+              if ! grep -Fx "$asset" <<<"$release_assets" >/dev/null; then
+                release_complete=false
+              fi
+            done
+            if [ "$FORCE_BUILD" = "true" ] || [ "$release_complete" != "true" ]; then
+              release_tag="$base_release_tag-rebuild-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            else
+              should_build=false
+            fi
+          fi
+          {
+            echo "tdlib_version=$tdlib_version"
+            echo "build_definition_sha=$build_definition_sha"
+            echo "release_tag=$release_tag"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+          echo "TDLib version: $tdlib_version"
+          echo "Upstream commit: $UPSTREAM_SHA"
+          echo "Build definition: $build_definition_sha"
+          echo "Release tag: $release_tag"
+          echo "Should build: $should_build"
+
+  build-android:
+    name: Android ${{ matrix.abi }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gperf clang libssl-dev zip
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" >/dev/null 2>&1 || \
+          yes | sdkmanager "ndk;28.2.13676358" >/dev/null 2>&1 || true
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Cache Android native build
+        uses: actions/cache@v6
+        with:
+          path: build/android-api23
+          key: android-${{ matrix.abi }}-${{ needs.prepare.outputs.upstream_short_sha }}-${{ needs.prepare.outputs.build_definition_sha }}
+
+      - name: Build tdjson Android asset
+        env:
+          TD_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          TD_ENABLE_LTO: OFF
+        run: bash scripts/build-android-libs.sh ${{ matrix.abi }}
+
+      - name: Upload Android asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdjson-android-${{ matrix.abi }}
+          path: dist/tdjson-android-${{ matrix.abi }}.zip
+          if-no-files-found: error
+
+  build-ios:
+    name: iOS XCFramework
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: brew install cmake ninja
+
+      - name: Cache iOS native build
+        uses: actions/cache@v6
+        with:
+          path: build/ios-min13.0
+          key: ios-${{ needs.prepare.outputs.upstream_short_sha }}-${{ needs.prepare.outputs.build_definition_sha }}
+
+      - name: Build tdjson iOS asset
+        env:
+          TD_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+        run: bash scripts/build-ios-xcframework.sh
+
+      - name: Upload iOS asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdjson-ios
+          path: dist/tdjson-ios.xcframework.zip
+          if-no-files-found: error
+
+  build-desktop:
+    name: ${{ matrix.label }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            label: Linux x64
+            os: ubuntu-24.04
+            architecture: x64
+            library: libtdjson.so
+            asset: tdjson-linux-x64.zip
+          - platform: linux
+            label: Linux arm64
+            os: ubuntu-24.04-arm
+            architecture: arm64
+            library: libtdjson.so
+            asset: tdjson-linux-arm64.zip
+          - platform: macos
+            label: macOS universal
+            os: macos-15
+            architecture: universal
+            library: libtdjson.dylib
+            asset: tdjson-macos-universal.zip
+          - platform: windows
+            label: Windows x64
+            os: windows-2022
+            architecture: x64
+            library: tdjson.dll
+            asset: tdjson-windows-x64.zip
+          - platform: windows
+            label: Windows arm64
+            os: windows-11-arm
+            architecture: arm64
+            library: tdjson.dll
+            asset: tdjson-windows-arm64.zip
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake gperf libssl-dev ninja-build zip zlib1g-dev
+
+      - name: Install macOS build tools
+        if: matrix.platform == 'macos'
+        run: brew install cmake ninja
+
+      - name: Install Windows native dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          # The Windows arm64 image ships no pre-bootstrapped vcpkg.
+          if (-not $env:VCPKG_INSTALLATION_ROOT -or
+              -not (Test-Path "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe")) {
+            $root = "$env:RUNNER_TEMP\vcpkg"
+            if (-not (Test-Path $root)) {
+              git clone --depth 1 https://github.com/microsoft/vcpkg.git $root
+            }
+            & "$root\bootstrap-vcpkg.bat" -disableMetrics
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+            $env:VCPKG_INSTALLATION_ROOT = $root
+            "VCPKG_INSTALLATION_ROOT=$root" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          $triplet = $env:ARCHITECTURE
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            "gperf:$triplet-windows" `
+            "openssl:$triplet-windows-static" `
+            "zlib:$triplet-windows-static"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          $gperfTools =
+            "$env:VCPKG_INSTALLATION_ROOT\installed\$triplet-windows\tools\gperf"
+          if (-not (Test-Path "$gperfTools\gperf.exe")) {
+            throw "vcpkg did not install gperf.exe"
+          }
+          $gperfTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache desktop native build
+        uses: actions/cache@v6
+        with:
+          path: build/desktop-${{ matrix.platform }}-${{ matrix.architecture }}
+          key: desktop-${{ matrix.platform }}-${{ matrix.architecture }}-${{ needs.prepare.outputs.upstream_short_sha }}-${{ needs.prepare.outputs.build_definition_sha }}
+
+      - name: Build desktop tdjson
+        shell: bash
+        env:
+          TD_COMMIT: ${{ needs.prepare.outputs.upstream_sha }}
+          TD_BUILD_JOBS: '2'
+        run: |
+          bash scripts/build-desktop-lib.sh \
+            "${{ matrix.platform }}" \
+            "dist/${{ matrix.library }}" \
+            "${{ matrix.architecture }}"
+
+      - name: Verify Windows exports
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeLibraryCheck {
+            [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+            public static extern IntPtr LoadLibrary(string path);
+            [DllImport("kernel32", SetLastError = true)]
+            public static extern IntPtr GetProcAddress(IntPtr module, string name);
+          }
+          '@
+          $library = (Resolve-Path "dist\tdjson.dll").Path
+          $module = [NativeLibraryCheck]::LoadLibrary($library)
+          if ($module -eq [IntPtr]::Zero) {
+            throw "Could not load tdjson.dll: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+          }
+          foreach ($symbol in @(
+            "td_create_client_id",
+            "td_send"
+          )) {
+            if ([NativeLibraryCheck]::GetProcAddress($module, $symbol) -eq [IntPtr]::Zero) {
+              throw "tdjson.dll does not export $symbol"
+            }
+          }
+
+      - name: Package desktop asset
+        shell: bash
+        run: bash scripts/package-desktop-lib.sh "dist/${{ matrix.library }}" "${{ matrix.asset }}" dist
+
+      - name: Upload desktop asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: tdjson-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish tdjson release
+    needs: [prepare, build-android, build-ios, build-desktop]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download tdjson assets
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          TDLIB_VERSION: ${{ needs.prepare.outputs.tdlib_version }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          BUILD_DEFINITION_SHA: ${{ needs.prepare.outputs.build_definition_sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          def sha256_stream(stream):
+              digest = hashlib.sha256()
+              while chunk := stream.read(1024 * 1024):
+                  digest.update(chunk)
+              return digest.hexdigest()
+
+          root = Path("release-assets")
+          assets = {}
+          for path in sorted(root.glob("*.zip")):
+              with path.open("rb") as stream:
+                  archive_sha256 = sha256_stream(stream)
+              members = {}
+              with zipfile.ZipFile(path) as archive:
+                  for info in archive.infolist():
+                      if info.is_dir():
+                          continue
+                      member = Path(info.filename)
+                      if member.is_absolute() or ".." in member.parts:
+                          raise SystemExit(
+                              f"unsafe member in {path.name}: {info.filename}"
+                          )
+                      if info.filename in members:
+                          raise SystemExit(
+                              f"duplicate member in {path.name}: {info.filename}"
+                          )
+                      with archive.open(info) as stream:
+                          members[info.filename] = {
+                              "sha256": sha256_stream(stream),
+                              "size": info.file_size,
+                          }
+              assets[path.name] = {
+                  "sha256": archive_sha256,
+                  "size": path.stat().st_size,
+                  "members": members,
+              }
+          expected = {
+              "tdjson-android-arm64-v8a.zip",
+              "tdjson-android-armeabi-v7a.zip",
+              "tdjson-android-x86_64.zip",
+              "tdjson-ios.xcframework.zip",
+              "tdjson-linux-arm64.zip",
+              "tdjson-linux-x64.zip",
+              "tdjson-macos-universal.zip",
+              "tdjson-windows-arm64.zip",
+              "tdjson-windows-x64.zip",
+          }
+          if set(assets) != expected:
+              raise SystemExit(f"unexpected release assets: {sorted(assets)}")
+          expected_members = {
+              "tdjson-android-arm64-v8a.zip": {
+                  "arm64-v8a/libtdjson.so",
+              },
+              "tdjson-android-armeabi-v7a.zip": {
+                  "armeabi-v7a/libtdjson.so",
+              },
+              "tdjson-android-x86_64.zip": {
+                  "x86_64/libtdjson.so",
+              },
+              "tdjson-linux-arm64.zip": {"libtdjson.so"},
+              "tdjson-linux-x64.zip": {"libtdjson.so"},
+              "tdjson-macos-universal.zip": {"libtdjson.dylib"},
+              "tdjson-windows-arm64.zip": {"tdjson.dll"},
+              "tdjson-windows-x64.zip": {"tdjson.dll"},
+          }
+          ios_prefixes = (
+              "tdjson.xcframework/Info.plist",
+              "tdjson.xcframework/ios-arm64/tdjson.framework/Info.plist",
+              "tdjson.xcframework/ios-arm64/tdjson.framework/Headers/tdjson.h",
+              "tdjson.xcframework/ios-arm64/tdjson.framework/Modules/module.modulemap",
+              "tdjson.xcframework/ios-arm64/tdjson.framework/tdjson",
+              "tdjson.xcframework/ios-arm64-simulator/tdjson.framework/Info.plist",
+              "tdjson.xcframework/ios-arm64-simulator/tdjson.framework/Headers/tdjson.h",
+              "tdjson.xcframework/ios-arm64-simulator/tdjson.framework/Modules/module.modulemap",
+              "tdjson.xcframework/ios-arm64-simulator/tdjson.framework/tdjson",
+          )
+          expected_members["tdjson-ios.xcframework.zip"] = set(ios_prefixes)
+          for asset_name, expected_asset_members in expected_members.items():
+              actual_members = set(assets[asset_name]["members"])
+              if actual_members != expected_asset_members:
+                  raise SystemExit(
+                      f"unexpected members in {asset_name}: {sorted(actual_members)}"
+                  )
+              empty = [
+                  member_name
+                  for member_name, metadata in assets[asset_name]["members"].items()
+                  if metadata["size"] <= 0
+              ]
+              if empty:
+                  raise SystemExit(f"empty members in {asset_name}: {empty}")
+          manifest = {
+              "schema_version": int(os.environ["ARTIFACT_SCHEMA_VERSION"]),
+              "release_tag": os.environ["RELEASE_TAG"],
+              "tdlib_version": os.environ["TDLIB_VERSION"],
+              "upstream_repository": "tdlib/td",
+              "upstream_sha": os.environ["UPSTREAM_SHA"],
+              "build_commit_sha": os.environ["GITHUB_SHA"],
+              "build_definition_sha256": os.environ["BUILD_DEFINITION_SHA"],
+              "assets": assets,
+          }
+          (root / "tdjson-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+          (
+            cd release-assets
+            sha256sum ./*.zip ./tdjson-manifest.json > SHA256SUMS
+          )
+          ls -lh release-assets
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "TDLib $TDLIB_VERSION ($UPSTREAM_SHA)" \
+            --notes "Complete schema-v$ARTIFACT_SCHEMA_VERSION tdjson artifacts built from official tdlib/td@$UPSTREAM_SHA (TDLib $TDLIB_VERSION). Build definition: $BUILD_DEFINITION_SHA." \
+            --latest
